@@ -161,13 +161,7 @@ graph TD
 
 在kernel-native模式下，基于envoy处理链。关于envoy处理链，见[istio.md](./istio.md#envoy-处理链).
 
-
-## controller
-与istiod建立连接，接受从istiod过来的配置信息，也就是说kmesh是通过istio来进行配置的。
-`istiod`：负责将控制平面的配置分发给数据平面的envoy代理。
-1. controller会从istiod那里获取所有的workload和service的地址。构建起从address到workload和service结构体的map。以waypoint和service的联系。这里可以看[k8s.md](./k8s.md#envoy)中的xDS部分。
-2. 更新有关的Cache。
-3. 同步更新 BPF map。
+**kernel-native 和 dual-engine 模式下的eBPF程序分别位于bpf/kmesh/ads和bpf/kmesh/workload目录下。关于两种模式下的eBPF程序，见后续的BPF部分。**
 
 ## workload 
 在kmesh中，workload是一个具体的，可寻址的工作负载实例，是数据平面路由的基本单元。
@@ -187,6 +181,7 @@ graph TD
 ## service 
 **endpoint**: 是 service - workload 之间的映射关系，每一个endpoint都有自己的优先级。endpoint有两个核心的数据结构，EndpointKey 和 EndpointValue。
 在 EndpointValue中backenduid是某一个workload的uid。EndpointKey中存储的是serviceid，这样就得到了 serviceid 到 backendid 的映射关系，也就得到了service到workload的映射关系。
+
 ``` go
 type EndpointKey struct {
     ServiceId    uint32  // 服务ID
@@ -199,6 +194,7 @@ type EndpointValue struct {
 }
 ```
 
+<!-- TODO: 将下面的部分转移到 kmesh daemon下 -->
 ## go 中四张 map
 包含serviceid、没有优先级的Endpoint数量，负载均衡策略，服务端口，目标端口，waypoint地址和端口。
 客户端访问一个workload的顺序是：FrontendMap -> ServiceMap -> EndpointMap -> BackendMap。通过backendvalue中的workload ip地址和端口来访问workload。
@@ -256,15 +252,80 @@ type FrontendValue struct {
 ```
 handleService -> updateServiceMap -> updateEndpointPriority -> updateEndpointOneByOne 这个函数构建起serviceid到endpoint的映射关系。同时构建EndpointKey和EndpointValue的信息。
 在endpointCache中构建起 \[endpoint][workloadUid][endpoint]的映射关系。
+
 ``` go
 func updateEndpointOneByOne
 ```
 
-
-
 ## BPF
 
-### C eBPF
+Kmesh项目中的BPF程序主要分为两种模式：Kernel-Native模式和Dual-Engine模式。两种模式下的BPF程序分别位于不同的目录中，且实现方式有所不同。
+
+eBPF文件主要位于`bpf/kmesh`目录下，下面对有关文件做一个介绍。
+
+**ads目录**
+
+- `cgroup_sock.c`
+    - 作用：在 TCP 连接发起阶段（connect4）进行 Listener 匹配与 FilterChain 选择，驱动 “L4/L7 上的 listener/filterchain/cluster” 路径。核心流程：
+        - 根据 ctx->user_ip4/user_port 构造地址，map_lookup_listener 获取 Listener（见 listener.h）
+        - 命中后通过 listener_manager() 进入 filter chain 的 tail call
+        - 在增强内核下尝试设置 TCP_ULP="kmesh_defer"，延迟接管主要包含两个核心函数：`cgroup_connect4_prog` 和 `cgroup_connect6_prog`，分别用于处理IPv4和IPv6的连接请求。
+    - 这些函数会在用户态程序调用`connect`系统调用时被触发，用于在连接建立前对目标地址进行修改，实现服务发现和负载均衡。
+    - 通过查找Frontend、Service、Endpoint和Backend四张BPF map，最终将目标地址修改为实际的workload地址。
+
+- `sockops.c`
+    - 程序类型：SEC("sockops")
+    - 作用：在 TCP 状态回调中配合 ADS 模式做连接建立/关闭时序处理（例如 on_cluster_sock_connect/on_cluster_sock_close），也会设置 BPF_SOCK_OPS_STATE_CB_FLAG 打开更细粒度事件回调。
+
+**头文件（ads/include/）：**
+
+- `listener.h`
+    - 定义 map_of_listener（Listener 配置的 eBPF Map），以及 listener_filter_chain_match、listener_manager 等匹配与调度逻辑
+    - 使用 tail call 进入 filter chain 程序，实现动态的链式处理
+- `filter.h`、`cluster.h`、`tcp_proxy.h`、`local_ratelimit.h`、`circuit_breaker.h`
+    - 各类过滤器/集群/代理/限流/熔断的协议与结构定义，供过滤器链路调用
+- `kmesh_common.h`、`tail_call.h`、`tail_call_index.h`、`ctx/…`
+    - 通用结构、tail-call 工具宏、上下文封装等
+- `route_config.h`
+    - 路由/匹配相关定义（在 ENHANCED_KERNEL 条件下启用）
+
+**workload/ 子目录**
+
+文件：
+- `cgroup_sock.c`
+    - 程序类型：SEC("cgroup/connect4")
+    - 作用：按“前端(frontend)→服务(service)→端点(endpoint)→后端(backend)”模型进行目的地选择与 DNAT/waypoint 决策
+    - 关键步骤：
+        - 从 map_of_frontend 找到 frontend 对应的 upstream/service/backend id
+        - 结合 map_of_service、map_of_endpoint、map_of_backend 做负载均衡/优先级选择，决定直连还是 waypoint
+        - 将原目的地写入 per-socket storage（map_of_sock_storage），供后续阶段（如 sockops/sk_msg）使用
+- `sockops.c`
+    - 程序类型：SEC("sockops")
+    - 作用：在 TCP 连接回调（active/passive established/state）阶段完成：
+        - 标记连接是否由 Kmesh 管理（is_managed_by_kmesh）
+        - 连接建立时根据是否经 waypoint 决定是否将当前 socket 插入 SockMap（map_of_kmesh_socket），以触发 sk_msg 程序对出站数据进行元数据编码或做直连优化
+        - 进行认证观测、状态清理（如关闭时清理 auth map）
+- `sendmsg.c`
+    - 程序类型：SEC("sk_msg")
+    - 作用：在发送路径对 payload 进行 TLV 编码（例如将原始目的地址/端口附带给 waypoint）；当存在 SockMap 匹配时可用于重定向或元数据注入
+- `workload/cgroup_skb.c`、`workload/xdp.c`
+    - 对部分包路径的补充（如 skb 层处理、XDP 加速/过滤入口），具体逻辑按实现为主（本仓中主要逻辑集中在 sock/消息路径）
+
+**头文件（workload/include/）：**
+
+- `workload.h`
+    - 定义核心 eBPF Map：map_of_frontend、map_of_service、map_of_endpoint、map_of_backend，以及认证与策略相关 map（如 map_of_auth_result、map_of_wl_policy）
+    - 这些 map 对应 Kmesh 控制面对接 xDS 后的内核态数据结构
+- `frontend.h`、`backend.h`、`service.h`、`endpoint.h`
+    - 各层抽象的键值与管理函数
+- `authz.h`
+    - 授权相关（连接建立时校验）
+- `workload_common.h`、`tail_call.h`、`xdp.h`、`config.h`
+    - 通用结构、tail call 支持、XDP 辅助、编译配置宏
+    
+要点：workload 目录体现以“服务/端点/工作负载”为中心的寻址与直连路径，结合 SockMap 达到同节点直连与 waypoint 旁路/编解码。
+
+### eBPF 编写
 
 **定义一个BPF map**
 在C语言中定义一个BPF map的方式如下：
@@ -292,8 +353,6 @@ struct {
 // 6. 这是最关键的一步！
 SEC(".maps");
 ```
-
-
 
 ### BPF map
 bpf 程序中维护了多张表，其中四张比较核心的是 frontend、service、endpoint 和 backend map。
@@ -375,6 +434,12 @@ KNIMap 是一个 LPM Trie 类型的 BPF map，用于存储 Kmesh 管理的 CIDR 
 上述是bpf程序的主要逻辑，还有些其他部分没有搞清楚。如handle_kmesh_manage_process和observe_on_pre_connect等函数的具体功能是什么，目前只知道也会进行查表操作。
 在经过bpf程序之后，数据应该会进入内核的网络栈中。
 
+#### 同节点和跨界点时的不同处理
+
+使用Kmesh后，同节点Pod间的服务通信不再需要经过网桥和节点网卡，而是通过eBPF的SockMap技术实现内核级的直接socket转发。
+
+
+
 ### 负载均衡策略
 三种负载均衡策略：**Random**、**Strict**、**Failover**。
 这里需要注意的是在 bpf 程序的实现中，随机方法和严格方法在代码上都是使用的最高优先级0中随机的bakend_index。我的理解是之所以都是使用最高优先级0，是因为在 random 使用方便，strict 可能则是因为优先级0代表的是本地性，所以严格方法也使用了优先级0， 而优先级的计算则由用户态的go程序来处理。
@@ -387,17 +452,9 @@ KNIMap 是一个 LPM Trie 类型的 BPF map，用于存储 Kmesh 管理的 CIDR 
 | **Strict** | 只用优先级0 | 严格失败 | 严格本地性的简单随机 |
 | **Failover** | 多优先级递减 | 自动降级 | 容错性强 |
 
-
-### BPF中的IPsec
-在tc_mark_encrypt函数中会将数据包的mark设置为0xe0，表示需要进行IPsec加密处理。
-
 ## CNI
 
 cni网络插件负责维护k8s集群中的路由规则？
-
-
-
-
 
 ## 语言相关
 **特殊的函数指针**
@@ -405,8 +462,6 @@ cni网络插件负责维护k8s集群中的路由规则？
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
 ```
 这个函数指针是一个特殊的函数指针，并不是真正的函数实现，而是一个占位符，在编译时会被替换为实际的系统调用。 (void *) 1 对应辅助函数的id。
-
-
 
 #### backend map
 #### endpoint map 
@@ -602,387 +657,6 @@ Lister 是一个查询工具，可以从 Kubernetes API Server 中获取资源�
 - handleKNIDelete：处理KmeshNodeInfo的删除事件。传入一个KmeshNodeInfo对象，首先调用handler.Clean函数根据目标IP来删除IPSec的State和Policy规则。然后调用deleteKNIMapCIDR函数来删除KNIMap中的CIDR信息。
 
 - processNextItem：处理工作队列中的任务。
-
-
-关于附加解密程序的逻辑如下：
-``` plain
-┌─────────────────────────────────────────────────────────────────┐
-│                    attachTcDecrypt()                            │
-│                                                                 │
-│  1. 获取宿主机网络命名空间路径                                    │
-│  2. 定义附加函数                                                 │
-│  3. 进入宿主机网络命名空间                                        │
-│     │                                                           │
-│     ▼                                                           │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │                  handleTc(TC_ATTACH)                        ││
-│  │                                                             ││
-│  │  1. 获取所有网络接口                                         │ │
-│  │  2. 过滤回环接口                                             │ │
-│  │  3. 检查接口是否包含节点IP                                    │ │
-│  │  4. 对匹配的接口附加TC程序                                    │ │
-│  │     │                                                       │ │
-│  │     ▼                                                       │ │
-│  │  ┌─────────────────────────────────────────────────────────┐ │ │
-│  │  │              ManageTCProgram()                          │ │ │
-│  │  │                                                         │ │ │
-│  │  │  1. 设置队列规则（qdisc）                                │ │ │
-│  │  │  2. 创建BpfFilter                                       │ │ │
-│  │  │  3. 附加到ingress钩子点                                  │ │ │
-│  │  └─────────────────────────────────────────────────────────┘ │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-
-如何附加TC解密程序到网络接口 ManageTCProgramByFd 函数中实现：
-
-### TC 框架核心概念解释：
-
-**1. Qdisc（队列规则）**：
-- Linux 内核中管理网络流量的机制
-- clsact 是专门用于分类和动作处理的特殊 qdisc
-- 提供 ingress/egress 钩子点，不进行实际队列调度
-
-**2. BpfFilter（eBPF 过滤器）**：
-- 将 eBPF 程序附加到网络接口的桥梁
-- 包含程序的文件描述符和配置参数
-- DirectAction=true 允许 eBPF 程序直接控制数据包命运
-
-**3. eBPF 程序 FD（文件描述符）**：
-- bpf2go 编译 C 代码 → Go 结构体
-- LoadAndAssign() 加载到内核 → 返回 FD
-- FD 是内核中已加载 eBPF 程序的引用
-
-### 完整的附加流程图：
-
-┌─────────────────────────────────────────────────────────────────┐
-│                    网络接口 (eth0)                                │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │                   clsact qdisc                              │ │
-│  │  (专门用于分类和动作处理，不缓存数据包)                         │ │
-│  │  ┌─────────────────────────────────────────────────────────┐ │ │
-│  │  │                ingress 钩子点                            │ │ │
-│  │  │  (数据包进入网络接口时的处理点)                            │ │ │
-│  │  │  ┌─────────────────────────────────────────────────────┐ │ │ │
-│  │  │  │              BpfFilter                              │ │ │ │
-│  │  │  │  • Name: tc_ingress-eth0                            │ │ │ │
-│  │  │  │  • Protocol: ETH_P_ALL (处理所有协议类型)           │ │ │ │
-│  │  │  │  • Priority: 1 (过滤器优先级)                      │ │ │ │
-│  │  │  │  • DirectAction: true (允许直接返回动作)            │ │ │ │
-│  │  │  │  • Fd: eBPF程序文件描述符 (指向内核中的程序)         │ │ │ │
-│  │  │  └─────────────────────────────────────────────────────┘ │ │ │
-│  │  └─────────────────────────────────────────────────────────┘ │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                 │
-│  数据包处理流程:                                                  │
-│  网络 ──→ 网络接口 ──→ clsact qdisc ──→ BpfFilter ──→ eBPF程序   │
-│                                    ↓                           │
-│            eBPF程序通过FD执行tc_mark_decrypt函数                 │
-│                                    ↓                           │
-│                   返回 TC_ACT_OK ──→ 继续到内核网络栈            │
-│                   返回 TC_ACT_DROP ──→ 丢弃数据包               │
-└─────────────────────────────────────────────────────────────────┘
-
-### eBPF 程序 FD 的完整来源链路：
-
-┌─────────────────────────────────────────────────────────────────┐
-│                   编译时 (bpf2go)                                │
-│                                                                 │
-│  tc_mark_decrypt.c ──→ bpf2go 工具 ──→ kmeshtcmarkdecrypt_*.go  │
-│  (C源码)              (编译工具)        (Go结构体)                │
-└─────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                   运行时加载                                      │
-│                                                                 │
-│  LoadKmeshTcMarkDecrypt() ──→ bpf(BPF_PROG_LOAD) ──→ 内核       │
-│  (Go加载函数)                  (系统调用)              (eBPF程序) │
-│                                    ↓                           │
-│                              返回 prog_fd                      │
-│                          (程序文件描述符)                        │
-└─────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                   使用阶段                                        │
-│                                                                 │
-│  decryptProg.FD() ──→ prog_fd ──→ BpfFilter.Fd ──→ 内核 TC 框架  │
-│  (获取FD)             (返回FD)     (附加到过滤器)    (执行程序)   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-最后的BpfFilter结构体的创建代码如下：
-``` go
-filter := &netlink.BpfFilter{
-    FilterAttrs: netlink.FilterAttrs{
-        LinkIndex: link.Attrs().Index,        // 网络接口索引
-        Parent:    netlink.HANDLE_MIN_INGRESS, // 附加点
-        Handle:    1,                         // 过滤器句柄
-        Protocol:  unix.ETH_P_ALL,            // 处理的协议类型
-        Priority:  1,                         // 优先级
-    },
-    Fd:           tcFd,                       // eBPF 程序文件描述符
-    Name:         "tc_ingress-eth0",          // 过滤器名称
-    DirectAction: true,                       // 直接动作模式
-}
-```
-
-
-
-数据结构如下
-``` go
-type IPSecController struct {
-    informer      cache.SharedIndexInformer    // K8s 资源监听器
-    lister        kmeshnodeinfov1alpha1.KmeshNodeInfoLister  // 节点信息查询器
-    queue         workqueue.TypedRateLimitingInterface[any]  // 工作队列
-    knclient      v1alpha1_clientset.KmeshNodeInfoInterface  // K8s 客户端
-    kmeshNodeInfo v1alpha1.KmeshNodeInfo       // 本地节点信息
-    ipsecHandler  *IpSecHandler                // IPSec 处理器
-    kniMap        *ebpf.Map                    // eBPF 映射表
-    tcDecryptProg *ebpf.Program                // TC 解密程序
-}
-
-ipsecController.kmeshNodeInfo = v1alpha1.KmeshNodeInfo{
-    ObjectMeta: metav1.ObjectMeta{
-        Name: localNodeName,
-    },
-    Spec: v1alpha1.KmeshNodeInfoSpec{
-        SPI:       ipsecController.ipsecHandler.Spi,  // 从加载的密钥获取 SPI
-        Addresses: []string{},                        // 节点 IP 地址列表
-        BootID:    localNode.Status.NodeInfo.BootID, // 节点启动 ID
-        PodCIDRs:  localNode.Spec.PodCIDRs,          // Pod CIDR 范围
-    },
-}
-
-```
-
-
-上述内容完成的是控制平面有关于解密的逻辑，还缺少IPsec加密的逻辑。
-
-**IPsec加密的逻辑**
-首先需要了解Kubernetes中CNI插件的概念。
-
-使用加密的设置在 enableTcMarkEncrypt 函数中进行 *kmesh/pkg/cni/plugin/plugin.go*。
-- enableTcMarkEncrypt 函数中首先会获取进行标记的bpf程序，然后再获取pod虚拟网卡在主机侧的对端索引。
-- 然后通过与加密同样的 ManageTCProgram 函数来附加TC加密程序。也就是说，加密程序是附加在pod虚拟网卡的出口网卡上。
-
-
-#### 数据平面实现
-
-#### 用户接口
-
-## 跨节点 Pod 通信的内核级数据包处理流程（Claude Sonnet总结）
-
-### 源节点数据包发送流程
-
-#### 1. 应用程序发起连接
-```
-应用进程 -> connect() 系统调用 -> 内核网络栈
-```
-
-#### 2. Cgroup eBPF 拦截和处理 (CONNECT 钩子)
-```c
-// 在 connect() 系统调用进入内核网络栈之前被触发
-cgroup_connect4_prog() {
-    // 解析目标地址，构建 frontend_key
-    frontend_k.addr.ip4 = orig_dst_addr.ip4;
-    
-    // 查找 frontend_map -> service_map -> endpoint_map -> backend_map
-    frontend_manager(kmesh_ctx, frontend_v);
-    
-    // 重写目标地址
-    SET_CTX_ADDRESS4(ctx, &kmesh_ctx.dnat_ip, kmesh_ctx.dnat_port);
-}
-```
-
-#### 3. 进入内核网络栈处理
-经过 eBPF 处理后，修改后的连接请求进入标准的内核网络栈：
-
-```
-Socket 层 -> TCP 层 -> IP 层 -> 路由决策
-```
-
-#### 4. 路由决策和转发
-```
-内核路由表查找 -> 确定出口网卡 -> 准备发送数据包
-```
-
-#### 5. TC eBPF 程序处理 (如果启用 IPsec)
-在数据包即将离开网卡前：
-```c
-// TC egress 钩子
-tc_mark_encrypt() {
-    // 为跨节点流量打上加密标记
-    mark = 0xe0; // egress 标记
-    // 标记数据包需要 IPsec 加密
-}
-```
-
-#### 6. XFRM 框架处理 (IPsec 加密)
-如果启用了 IPsec：
-```
-数据包 -> XFRM Policy 匹配 -> XFRM State 查找 -> ESP 封装 -> 加密
-```
-
-#### 7. 物理网卡发送
-```
-网卡驱动 -> 物理介质 -> 网络传输
-```
-
-### 网络传输阶段
-
-#### 8. 跨节点网络路由
-```
-源节点网卡 -> 交换机/路由器 -> 目标节点网卡
-```
-
-### 目标节点数据包接收流程
-
-#### 9. 物理网卡接收
-```
-网络介质 -> 网卡驱动 -> 内核网络栈
-```
-
-#### 10. XFRM 框架处理 (IPsec 解密)
-如果是加密流量：
-```
-加密数据包 -> XFRM Policy 匹配 -> ESP 解封装 -> 解密 -> 原始数据包
-```
-
-#### 11. TC eBPF 程序处理 (如果启用 IPsec)
-在数据包进入网卡后：
-```c
-// TC ingress 钩子
-tc_mark_decrypt() {
-    // 处理加密标记
-    mark = 0xd0; // ingress 标记
-    // 标记已完成解密处理
-}
-```
-
-#### 12. IP 层路由决策
-```
-IP 层 -> 路由表查找 -> 确定目标为本地 Pod
-```
-
-#### 13. XDP eBPF 程序处理 (授权检查)
-在 Pod 网络接口上：
-```c
-// XDP 钩子，最早的包处理点
-xdp_authz() {
-    // 根据源/目标信息查找授权策略
-    // 允许/拒绝流量
-    return XDP_PASS; // 或 XDP_DROP
-}
-```
-
-#### 14. 到达目标 Pod
-```
-本地路由 -> Pod 网络命名空间 -> 目标进程
-```
-
-### Service 规则与路由决策的详细影响
-
-#### Service 负载均衡策略对路由的影响：
-Kmesh 在 `service_manager()` 中实现了多种负载均衡策略，直接影响跨节点通信的路由选择：
-
-```c
-// 从 service.h 中的核心路由逻辑
-switch (service_v->lb_policy) {
-    case LB_POLICY_RANDOM:      // 随机选择 endpoint
-    case LB_POLICY_STRICT:      // 严格本地性优先 (同节点优先)
-    case LB_POLICY_FAILOVER:    // 本地性故障转移
-}
-```
-
-**优先级队列机制 (PRIO_COUNT)**：
-- **prio_endpoint_count[0]**: 最高优先级 (通常是同节点 endpoints)
-- **prio_endpoint_count[1-6]**: 按地理位置递减的优先级
-- 在 `lb_locality_failover_handle()` 中依次尝试不同优先级
-
-#### 内核路由决策的具体过程：
-1. **Frontend Map 查找**: 根据目标 IP 找到对应的 service_id
-2. **Service Map 查找**: 获取负载均衡策略和 endpoint 分布
-3. **Endpoint Map 查找**: 基于优先级和随机算法选择具体 backend
-4. **Backend Map 查找**: 获取最终的目标 IP 和端口
-5. **地址重写**: 修改 socket 的目标地址
-
-#### 同节点连接的内核级优化：
-虽然 Kmesh 中所有连接都经过 eBPF 处理，但"同节点直接连接"体现在：
-- **优先级 0**: 同节点的 endpoints 被赋予最高优先级
-- **路由表优化**: 内核路由表中同节点路由跳数最少
-- **网络栈简化**: 无需跨网卡转发，直接通过 loopback 或 veth pair
-
-### 关键内核处理点总结
-
-#### eBPF 挂载点处理顺序：
-1. **Cgroup Connect (源节点)**：地址重写和服务发现
-2. **TC Egress (源节点)**：加密标记和 IPsec 处理  
-3. **TC Ingress (目标节点)**：解密处理
-4. **XDP (目标节点)**：授权检查和流量控制
-
-#### 网络栈处理层次：
-```
-应用层 (connect())
-    ↓
-传输层 (TCP/UDP) 
-    ↓  
-网络层 (IP路由)
-    ↓
-数据链路层 (网卡驱动)
-    ↓
-物理层 (网络介质)
-```
-
-#### 数据包在内核中的详细处理路径：
-
-**源节点处理路径**：
-```
-connect() 系统调用
-    ↓
-Cgroup eBPF (BPF_CGROUP_INET4_CONNECT)
-    ↓ [地址重写完成]
-内核 TCP/IP 协议栈
-    ↓
-路由子系统 (确定出口网卡)
-    ↓
-TC eBPF (tc_mark_encrypt) [如果启用 IPsec]
-    ↓ [打上 0xe0 标记]
-XFRM 子系统 [IPsec 加密]
-    ↓ [ESP 封装]
-网卡驱动 (物理发送)
-```
-
-**目标节点处理路径**：
-```
-网卡驱动 (接收数据包)
-    ↓
-XFRM 子系统 [IPsec 解密]
-    ↓ [ESP 解封装]
-TC eBPF (tc_mark_decrypt) [如果启用 IPsec]
-    ↓ [处理 0xd0 标记]
-路由子系统 (确定本地路由)
-    ↓
-XDP eBPF (xdp_authz) [授权检查]
-    ↓ [XDP_PASS 或 XDP_DROP]
-内核网络栈 (IP/TCP 处理)
-    ↓
-目标进程 socket
-```
-
-#### 内核 Netfilter 集成点：
-- **PREROUTING**: XFRM 解密后的数据包路由前处理
-- **FORWARD**: 跨节点转发时的策略检查
-- **INPUT**: 到达本机的数据包最终处理
-- **OUTPUT**: 本机发出数据包的初始处理
-- **POSTROUTING**: 数据包离开本机前的最后处理
-
-#### Kmesh 与标准 Linux 网络栈的集成：
-- **不替换**标准网络栈，而是在关键点**增强**处理能力
-- **eBPF 程序**在内核空间高效处理，避免用户态代理开销
-- **保持兼容性**，应用程序无需修改
-- **性能优化**：相比传统 sidecar 减少了用户态/内核态切换开销
-
-这个过程展现了 Kmesh 如何通过 eBPF 在内核的多个关键点进行流量治理，实现高性能的服务网格数据平面，同时保持与标准 Linux 网络栈的完美集成。
 
 ## kmeshctl
 
