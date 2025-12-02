@@ -439,10 +439,10 @@ int sockops_prog(struct bpf_sock_ops *skops)
         return 0;
 
     switch (skops->op) {
-    case BPF_SOCK_OPS_TCP_CONNECT_CB:
+    case BPF_SOCK_OPS_TCP_CONNECT_CB: // 这部分应该是在发送SYN之前，在 cgroup_connect4/6 之后触发
         skops_handle_kmesh_managed_process(skops);
         break;
-    case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
+    case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB: // 在发送数据的时候触发
         if (!is_managed_by_kmesh(skops))
             break;
         observe_on_connect_established(skops->sk, OUTBOUND);
@@ -480,5 +480,173 @@ int sockops_prog(struct bpf_sock_ops *skops)
         break;
     }
     return 0;
+}
+```
+
+1. 调用connect()系统调用时，会触发 BPF_SOCK_OPS_TCP_CONNECT_CB 事件，从而调用 skops_handle_kmesh_managed_process 函数。
+
+```c
+static inline void skops_handle_kmesh_managed_process(struct bpf_sock_ops *skops)
+{
+    // 通过判断是否访问的是特定的端口和地址，来决定是否将该连接标记为由 kmesh 管理和删除
+    // 这里的连接发起应该是由cni插件发起的，在创建和删除pod的过程中触发，这样kmesh就能记录和管理pod的ip地址，从而知道哪些ip是kmesh管理的
+    if (skops_conn_from_cni_sim_add(skops))
+        record_kmesh_managed_ip(skops->family, skops->local_ip4, skops->local_ip6);
+    if (skops_conn_from_cni_sim_delete(skops))
+        remove_kmesh_managed_ip(skops->family, skops->local_ip4, skops->local_ip6);
+}
+```
+
+2. BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB
+连接建立完成时触发，用于启用waypoint的元数据编码，即在 sendmsg.c 中的 eBPF 程序 sendmsg_prog 会插入元数据。这里具体怎么启用的，目前还没有搞清楚。
+
+3. BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB
+服务端这边新连接三次握手刚完成、子 socket 建好”的那个瞬间触发，用来做入向连接的观测、订阅后续状态回调、以及把连接元组送去做认证。
+
+4. BPF_SOCK_OPS_STATE_CB
+连接状态变化时触发，这里只关心连接关闭事件（BPF_TCP_CLOSE），用于做连接关闭的观测和清理认证信息。
+
+#### cgroup_skb.c
+
+**该文件挂载的eBPF程序是 cgroup_skb_ingress_prog 和 cgroup_skb_egress_prog, 主要是用于观测。**
+
+**cgroup/skb 钩子简介**
+- 位置: 挂载在 cgroup v2 上，工作在网络协议栈的 IP 层。
+- 触发时机:
+  - cgroup_skb/ingress: 当一个数据包进入一个 cgroup 内的 Pod 的网络命名空间时触发。
+  - cgroup_skb/egress: 当一个数据包离开一个 cgroup 内的 Pod 的网络命名空间时触发。
+- 能力: 可以读取、修改甚至丢弃（返回 SK_DROP）数据包。但在 Kmesh 的这个实现中，它只读取，不修改也不丢弃，是一个纯粹的“观察者”。
+
+
+```c
+SEC("cgroup_skb/ingress")
+int cgroup_skb_ingress_prog(struct __sk_buff *skb)
+{
+    if (!is_monitoring_enable() || !is__periodic_report_enable()) { // 只有当“监控功能”和“周期性报告”同时启用时，才会继续执行
+        return SK_PASS;
+    }
+    if (skb->family != AF_INET && skb->family != AF_INET6)
+        return SK_PASS;
+
+    struct bpf_sock *sk = skb->sk;
+    if (!sk)
+        return SK_PASS;
+
+    if (sock_conn_from_sim(skb)) { // 用于判断是否是指向特定ip和端口的流量，之前的内容中又提到这个特殊的IP和端口是cni插件用来创建和删除pod的时候发起的
+        return SK_PASS;
+    }
+
+    if (!is_managed_by_kmesh_skb(skb)) // 判断 skb 中的 IP 地址是否属于 kmesh 管理的范围，查找 map_of_manager
+        return SK_PASS;
+
+    observe_on_data(sk);
+    return SK_PASS;
+}
+
+SEC("cgroup_skb/egress")
+int cgroup_skb_egress_prog(struct __sk_buff *skb)
+{
+    if (!is_monitoring_enable() || !is__periodic_report_enable()) {
+        return SK_PASS;
+    }
+    if (skb->family != AF_INET && skb->family != AF_INET6)
+        return SK_PASS;
+
+    struct bpf_sock *sk = skb->sk;
+    if (!sk)
+        return SK_PASS;
+
+    if (sock_conn_from_sim(skb)) {
+        return SK_PASS;
+    }
+
+    if (!is_managed_by_kmesh_skb(skb))
+        return SK_PASS;
+
+    observe_on_data(sk); // 核心功能
+    return SK_PASS;
+}
+```
+
+```c
+static inline void observe_on_data(struct bpf_sock *sk)
+{
+    struct bpf_tcp_sock *tcp_sock = NULL;
+    struct sock_storage_data *storage = NULL;
+    if (!sk)
+        return;
+
+    tcp_sock = bpf_tcp_sock(sk);
+    if (!tcp_sock)
+        return;
+
+    storage = bpf_sk_storage_get(&map_of_sock_storage, sk, 0, 0);
+    if (!storage) {
+        // maybe the connection is established before kmesh start
+        return;
+    }
+    __u64 now = bpf_ktime_get_ns();
+    if ((storage->last_report_ns != 0) && (now - storage->last_report_ns > LONG_CONN_THRESHOLD_TIME)) {
+        tcp_report(sk, tcp_sock, storage, BPF_TCP_ESTABLISHED);
+    }
+}
+```
+
+1. 观测/读取的内容:
+
+- 从 `bpf_tcp_sock *tcp_sock` 中读取 TCP 协议栈的各种底层指标，例如：
+    - `bytes_sent`: 已发送的总字节数。
+    - `bytes_received`: 已接收的总字节数。
+    - `segs_in`: 入向的 TCP 段（包）数量。
+    - `segs_out`: 出向的 TCP 段（包）数量。
+    - `srtt_us`: 平滑往返时间（Smoothed Round-Trip Time）。
+    - `rtt_min`: 最小往返时间。
+    - ... 等等其他 TCP 拥塞控制和性能相关的指标。
+- 从 `struct sock_storage_data *storage` 中读取 Kmesh 自己记录的上下文信息，如 direction、connect_ns 等。
+
+2. 更新的参数:
+`tcp_report` 函数会将上述读取到的指标填充到一个 `struct tcp_conn_info` 结构体中。
+然后，它会调用 `bpf_ringbuf_output`，将这个 `tcp_conn_info` 结构体作为一个事件，发送到用户态。
+最关键的是，在发送完报告后，`tcp_report` 会更新 `storage->last_report_ns = bpf_ktime_get_ns();`。它将 `storage` 中的“上次报告时间”重置为当前时间。
+
+## oncn-mda
+
+该文件夹下的文件主要用于同节点下的通信加速。`mda`的意思是`mesh data accelerate`。`oncn`的意思可能是是`on cluster node`或者是`Open Cloud Native`。
+
+### ebpf_src
+
+#### sock_redirect.c
+
+**该文件挂载的eBPF程序是 SOCK_REDIRECT_NAME, 该程序挂载在 sk_msg 上。用于对本机内的socket间通过新进行加速，跳过内核网络协议栈。直接发送至socket接收队列。**
+
+```c
+SEC("sk_msg")
+int SOCK_REDIRECT_NAME(struct sk_msg_md *const msg)
+{
+    struct sock_key key = {0};
+    struct sock_key *redir_key = NULL;
+    long ret = 0;
+
+    key.sip4 = msg->local_ip4;
+    key.dip4 = msg->remote_ip4;
+    key.sport = (bpf_htonl(msg->local_port) >> 16);
+    key.dport = (force_read(msg->remote_port) >> 16);
+#if MDA_LOOPBACK_ADDR
+    set_netns_cookie((void *)msg, &key);
+#endif
+
+    redir_key = bpf_map_lookup_elem(&SOCK_OPS_PROXY_MAP_NAME, &key);
+    if (redir_key != NULL) {
+        ret = bpf_msg_redirect_hash(msg, &SOCK_OPS_MAP_NAME, redir_key, BPF_F_INGRESS);
+        if (ret != SK_DROP) {
+            bpf_log(DEBUG, "redirect the sk success\n");
+
+        } else {
+            // If you connect to the peer machine, you do end up in this branch
+            bpf_log(INFO, "no such socket, may be peer socket on another machine\n");
+        }
+    }
+
+    return SK_PASS;
 }
 ```

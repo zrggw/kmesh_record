@@ -1,0 +1,9 @@
+title: "Kmesh Documentation"
+description: "record of kmesh project"
+theme: jekyll-theme-minimal
+
+markdown: kramdown
+highlighter: rouge
+
+kramdown:
+  input: GFM

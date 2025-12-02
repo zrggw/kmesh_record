@@ -1,5 +1,31 @@
 ## Kmesh 架构
 
+**两种模式的定位**
+
+- Kernel-Native 模式
+    - 数据面完全运行在 eBPF 中：bpf/kmesh/ads/... 里实现 L3-L7 编排，比如 tcp_proxy filter、权重灰度、熔断、限流等。
+    - 控制面直接对接 Istio XDS，转换配置写入内核 BPF map。
+    - 能力目前最完整，像灰度发布就是在这一套代码路径中实现。
+- Dual-Engine 模式
+    - 由 eBPF 处理 L4 连接劫持、DNS、Waypoint 引流等“内核擅长的”工作。
+    - HTTP/gRPC 等 L7 逻辑则交给 Waypoint Envoy（或其他 sidecarless L7 组件）处理，因此控制面在 pkg/controller/workload/... 中更多关注“把谁导给谁”。
+    - 当前仅提供随机、基于拓扑的 L4 负载均衡，灰度这类精细调度需要在 Waypoint/L7 侧完成。
+
+**为什么需要“双轨”**
+
+| 需求场景 | Kernel-Native 模式 | Dual-Engine 模式 |
+|----------|-------------------|------------------|
+| 纯 L4 治理（灰度、熔断、限流等） | ✔：eBPF 直接完成 | △：需扩展或走 L7 |
+| 快速体验/渐进式落地（从无网格到网格） | △：一次性接管 L3-L7，需适配完整能力 | ✔：先启用 L4 安全，再按需挂载 Waypoint |
+| L7 协议兼容性、Istio 生态 | 需要 eBPF 端对协议进行解析，特性上线节奏略慢 | Waypoint 复用 Envoy 能力，扩展快 |
+| 性能极致（尽量少跳用户态） | ✔：L3-L7 都在内核态完成 | △：L7 需经过 Waypoint |
+| 运维复杂度 | 单一组件，逻辑集中 | 需要维护 eBPF + Waypoint 两套组件 |
+
+因此：
+
+- Kernel-Native 更像“全内核数据面”，适合希望 eBPF 一站式提供所有流量治理能力的场景。
+- Dual-Engine 则是“内核 + Waypoint”混合体，帮助用户按需、渐进地引入 L7 能力，同时保留 eBPF L4 控制的优势。
+
 ### Kmesh daemon
 
 ```mermaid
