@@ -1,11 +1,11 @@
-# 欢迎来到我的文档网站
+# Welcome to My Documentation Site
 
-这里是项目的文档索引。
+This site hosts the documentation and issue logs for the Kmesh project.
 
-## 文档目录
+## Documentation Index
 
-- [问题记录](./problems/kmesh-problems.md)
-- [Kmesh 开发指南](./problems/kmesh-dev-guide.md)
-- [kmesh架构](./note/kmesh.md)
-- [kmesh代码详解](./note/kmesh源码.md)
+- [Kmesh problems recorded](./problems/kmesh-problems.md)
+- [Kmesh development guide](./problems/kmesh-dev-guide.md)
+- [Kmesh architecture](./note/kmesh.md)
+- [Kmesh code deep dive](./note/kmesh源码.md)
 
