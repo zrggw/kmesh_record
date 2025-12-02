@@ -1,8 +1,3 @@
----
-title: Kmesh 问题记录
-layout: default
----
-
 # Kmesh 问题记录
 
 本文主要记录个人在进行 Kmesh 开发过程中遇到的问题和解决方法。
