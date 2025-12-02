@@ -1,0 +1,26 @@
+---
+---
+
+@import "{{ site.theme }}";
+
+/* Override theme defaults to increase width */
+@media print, screen and (min-width: 960px) {
+  .wrapper {
+    width: 1200px; /* Increase from default ~800px */
+    max-width: 95%;
+  }
+
+  section {
+    width: 850px; /* Increase from default ~500px */
+  }
+}
+
+@media print, screen and (min-width: 1400px) {
+  .wrapper {
+    width: 1400px;
+  }
+
+  section {
+    width: 1050px;
+  }
+}
